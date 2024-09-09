@@ -3,7 +3,7 @@ use anchor_lang::{
     solana_program::hash::hash,
     system_program::{transfer, Transfer},
 };
-use solana_pastel_oracle::Oracle;
+use solana_pastel_oracle::{AggregatedConsensusInfo, Oracle};
 
 declare_id!("G7uVj97ovf94Eayow7Cujyt2eqJirDoiU65xbaE323fV");
 
@@ -54,6 +54,10 @@ pub mod solana_pastel_bridge {
 
     pub fn submit_pastel_txid(ctx: Context<SubmitPastelTxid>, pastel_txid: String) -> Result<()> {
         ctx.accounts.handle(&pastel_txid)
+    }
+
+    pub fn access_oracle_data(ctx: Context<AccessOracleData>) -> Result<()> {
+        ctx.accounts.handle()
     }
 }
 
@@ -199,7 +203,7 @@ const MAX_DURATION_IN_SECONDS_FROM_LAST_REPORT_SUBMISSION_BEFORE_SELECTING_WINNI
 const DATA_RETENTION_PERIOD: u64 = 24 * 60 * 60; // How long to keep data in the contract state (1 day)
 const TXID_STATUS_VARIANT_COUNT: usize = 4; // Manually define the number of variants in TxidStatus
 const MAX_TXID_LENGTH: usize = 64; // Maximum length of a TXID
-const MAX_ALLOWED_TIMESTAMP_DIFFERENCE: u64 = 600; // 10 minutes in seconds; maximum allowed time difference between the last update of the oracle's consensus data and the bridge contract's access to this data to ensure the bridge contract acts on timely and accurate data.
+const MAX_ALLOWED_TIMESTAMP_DIFFERENCE: i64 = 600; // 10 minutes in seconds; maximum allowed time difference between the last update of the oracle's consensus data and the bridge contract's access to this data to ensure the bridge contract acts on timely and accurate data.
 const LAMPORTS_PER_SOL: u64 = 1_000_000_000; // Number of lamports in one SOL
 
 // Enums:
@@ -342,20 +346,20 @@ pub struct ServiceRequest {
     pub bridge: Pubkey,
     pub service_type: PastelTicketType, // Type of service requested (e.g., Sense, Cascade, Nft).
     pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String, // First 6 characters of the SHA3-256 hash of the file involved in the service request.
-    pub ipfs_cid: String,         // IPFS Content Identifier for the file.
-    pub file_size_bytes: u64,     // Size of the file in bytes.
-    pub user_sol_address: Pubkey, // Solana address of the end user who initiated the service request.
-    pub status: RequestStatus,    // Current status of the service request.
+    pub ipfs_cid: String,        // IPFS Content Identifier for the file.
+    pub file_size_bytes: u64,    // Size of the file in bytes.
+    pub user: Pubkey, // Solana address of the end user who initiated the service request.
+    pub status: RequestStatus, // Current status of the service request.
     pub payment_in_escrow: bool, // Indicates if the payment for the service is currently in escrow.
-    pub request_expiry: i64,     // Timestamp when the service request expires.
+    pub request_expiry: i64, // Timestamp when the service request expires.
     pub sol_received_from_user_timestamp: Option<u64>, // Timestamp when SOL payment is received from the end user for the service request to be held in escrow.
     pub selected_bridge_node: Option<Pubkey>, // The Pastel ID of the bridge node selected to fulfill the service request.
     pub best_quoted_price_in_lamports: Option<u64>, // Price quoted for the service in lamports.
     pub service_request_creation_timestamp: i64, // Timestamp when the service request was created.
     pub bridge_node_selection_timestamp: Option<i64>, // Timestamp when a bridge node was selected for the service.
     pub bridge_node_submission_of_txid_timestamp: Option<i64>, // Timestamp when the bridge node submitted the Pastel transaction ID for the service request.
-    pub submission_of_txid_to_oracle_timestamp: Option<u64>, // Timestamp when the Pastel transaction ID was submitted by the bridge contract to the oracle contract for monitoring.
-    pub service_request_completion_timestamp: Option<u64>, // Timestamp when the service was completed.
+    pub submission_of_txid_to_oracle_timestamp: Option<i64>, // Timestamp when the Pastel transaction ID was submitted by the bridge contract to the oracle contract for monitoring.
+    pub service_request_completion_timestamp: Option<i64>, // Timestamp when the service was completed.
     pub payment_received_timestamp: Option<u64>, // Timestamp when the payment was received into escrow.
     pub payment_release_timestamp: Option<u64>, // Timestamp when the payment was released from escrow, if applicable.
     pub escrow_amount_lamports: Option<u64>, // Amount of SOL held in escrow for this service request.
@@ -379,13 +383,13 @@ impl ServiceRequest {
             PastelTicketType::InferenceApi => String::from("InferenceApi"),
         };
 
-        let user_sol_address_string = self.user_sol_address.to_string();
+        let user_address_string = self.user.to_string();
 
         let concatenated_str = format!(
             "{}{}{}",
             service_type_string,
             self.first_6_characters_of_sha3_256_hash_of_corresponding_file,
-            user_sol_address_string,
+            user_address_string,
         );
 
         // Convert the concatenated string to bytes
@@ -431,21 +435,6 @@ pub struct BestPriceQuote {
 impl BestPriceQuote {
     pub const LEN: usize = 1000; // todo: calculate correct length
     pub const PREFIX: &'static [u8] = b"best_price_quote";
-}
-
-#[account]
-pub struct AggregatedConsensus {
-    pub bridge: Pubkey,
-    pub txid: String,
-    pub status_weights: [i32; TXID_STATUS_VARIANT_COUNT],
-    pub hash_weights: Vec<HashWeight>,
-    pub first_6_characters_of_sha3_256_hash_of_corresponding_file: String,
-    pub last_updated_ts: i64, // Unix timestamp indicating the last update time
-}
-
-impl AggregatedConsensus {
-    pub const LEN: usize = 1000; // todo: calculate correct length
-    pub const PREFIX: &'static [u8] = b"aggregated_consensus";
 }
 
 #[derive(Accounts)]
@@ -615,7 +604,7 @@ impl<'info> SubmitServiceRequest<'info> {
                 .clone(),
             ipfs_cid: ipfs_cid.clone(),
             file_size_bytes,
-            user_sol_address: self.user.key(),
+            user: self.user.key(),
             status: RequestStatus::Pending,
             payment_in_escrow: false,
             request_expiry: current_timestamp + ESCROW_DURATION, // Set appropriate expiry timestamp
@@ -810,6 +799,163 @@ impl<'info> SubmitPastelTxid<'info> {
             .bridge_node_submission_of_txid_timestamp = Some(Clock::get()?.unix_timestamp);
         self.service_request.status = RequestStatus::AwaitingCompletionConfirmation;
 
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct AccessOracleData<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        constraint = aggregated_consensus_info.oracle == bridge.oracle.unwrap(),
+        constraint = aggregated_consensus_info.txid == *service_request.pastel_txid.as_ref().unwrap(),
+    )]
+    pub aggregated_consensus_info: Account<'info, AggregatedConsensusInfo>,
+
+    #[account(mut, has_one = bridge_reward_pool, has_one = bridge_escrow)]
+    pub bridge: Account<'info, Bridge>,
+
+    #[account(mut, has_one = bridge, has_one = reward_address)]
+    pub bridge_node: Account<'info, BridgeNode>,
+
+    #[account(mut, has_one = bridge, has_one = user)]
+    pub service_request: Account<'info, ServiceRequest>,
+
+    /// CHECK: OK
+    #[account(mut)]
+    pub reward_address: UncheckedAccount<'info>,
+
+    /// CHECK: OK
+    #[account(mut)]
+    pub bridge_reward_pool: UncheckedAccount<'info>,
+
+    /// CHECK: OK
+    #[account(mut)]
+    pub bridge_escrow: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> AccessOracleData<'info> {
+    pub fn handle(&mut self) -> Result<()> {
+        let escrow_amount = self.service_request.escrow_amount_lamports.unwrap();
+        let current_timestamp = Clock::get()?.unix_timestamp;
+
+        let bridge_escrow_signer_seeds: &[&[&[u8]]] = &[&[
+            Bridge::ESCROW_PREFIX,
+            &self.bridge.key().to_bytes(),
+            &[self.bridge.bridge_escrow_bump],
+        ]];
+
+        if current_timestamp > self.service_request.request_expiry {
+            self.service_request.status = RequestStatus::Failed;
+
+            return transfer(
+                CpiContext::new(
+                    self.system_program.to_account_info(),
+                    Transfer {
+                        from: self.bridge_escrow.to_account_info(),
+                        to: self.user.to_account_info(),
+                    },
+                )
+                .with_signer(bridge_escrow_signer_seeds),
+                escrow_amount,
+            );
+        }
+
+        require_gte!(
+            self.aggregated_consensus_info.last_updated + MAX_ALLOWED_TIMESTAMP_DIFFERENCE,
+            current_timestamp,
+            BridgeError::OutdatedConsensusData
+        );
+
+        if self
+            .service_request
+            .first_6_characters_of_sha3_256_hash_of_corresponding_file
+            == self
+                .aggregated_consensus_info
+                .first_6_characters_of_sha3_256_hash_of_corresponding_file
+        {
+            let service_fee =
+                u64::try_from(escrow_amount as u128 * TRANSACTION_FEE_PERCENTAGE as u128 / 100)
+                    .unwrap();
+            let amount_to_bridge_node = escrow_amount - service_fee;
+
+            self.service_request.status = RequestStatus::Completed;
+            self.service_request.service_request_completion_timestamp = Some(current_timestamp);
+
+            // Transfer the service fee to the bridge reward pool account
+            transfer(
+                CpiContext::new(
+                    self.system_program.to_account_info(),
+                    Transfer {
+                        from: self.bridge_escrow.to_account_info(),
+                        to: self.bridge_reward_pool.to_account_info(),
+                    },
+                )
+                .with_signer(bridge_escrow_signer_seeds),
+                service_fee,
+            )?;
+
+            // Send the remaining amount to the bridge node
+            transfer(
+                CpiContext::new(
+                    self.system_program.to_account_info(),
+                    Transfer {
+                        from: self.bridge_escrow.to_account_info(),
+                        to: self.reward_address.to_account_info(),
+                    },
+                )
+                .with_signer(bridge_escrow_signer_seeds),
+                amount_to_bridge_node,
+            )
+        } else {
+            self.service_request.status = RequestStatus::Failed;
+
+            transfer(
+                CpiContext::new(
+                    self.system_program.to_account_info(),
+                    Transfer {
+                        from: self.bridge_escrow.to_account_info(),
+                        to: self.user.to_account_info(),
+                    },
+                )
+                .with_signer(bridge_escrow_signer_seeds),
+                escrow_amount,
+            )
+        }
+    }
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFunds<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(mut, has_one = admin, has_one = bridge_reward_pool, has_one = bridge_escrow)]
+    pub bridge: Account<'info, Bridge>,
+
+    #[account(mut, close = admin, has_one = bridge)]
+    pub bridge_node: Account<'info, BridgeNode>,
+
+    #[account(mut, close = admin, has_one = bridge)]
+    pub service_request: Account<'info, ServiceRequest>,
+
+    /// CHECK: OK
+    #[account(mut)]
+    pub bridge_reward_pool: UncheckedAccount<'info>,
+
+    /// CHECK: OK
+    #[account(mut)]
+    pub bridge_escrow: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> WithdrawFunds<'info> {
+    pub fn handle(&mut self) -> Result<()> {
         Ok(())
     }
 }
