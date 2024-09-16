@@ -18,7 +18,7 @@ pub mod solana_pastel_bridge {
 
     pub fn register_new_bridge_node(
         ctx: Context<RegisterNewBridgeNode>,
-        pastel_id: String,
+        pastel_id: [u8; 32],
         bridge_node_psl_address: String,
     ) -> Result<()> {
         ctx.accounts
@@ -274,12 +274,6 @@ pub enum RequestStatus {
     Refunded,                       // Indicates that the request has been refunded to the user.
 }
 
-#[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize)]
-pub struct HashWeight {
-    pub hash: String,
-    pub weight: i32,
-}
-
 // The nodes that perform the service requests on behalf of the end users are called bridge nodes.
 #[account]
 pub struct Bridge {
@@ -304,7 +298,7 @@ impl Bridge {
 #[account]
 pub struct BridgeNode {
     pub bridge: Pubkey,
-    pub pastel_id: String, // The unique identifier of the bridge node in the Pastel network, used as the primary key throughout the bridge contract to identify the bridge node.
+    pub pastel_id: [u8; 32], // The unique identifier of the bridge node in the Pastel network, used as the primary key throughout the bridge contract to identify the bridge node.
     pub reward_address: Pubkey, // The Solana address of the bridge node, used to send rewards to the bridge node.
     pub bridge_node_psl_address: String, // The Pastel address of the bridge node, used to pay for service requests made by the bridge node on behalf of end users.
     pub registration_entrance_fee_transaction_signature: String, // The signature of the transaction that paid the registration fee in SOL for the bridge node to register with the bridge contract.
@@ -325,7 +319,7 @@ pub struct BridgeNode {
 }
 
 impl BridgeNode {
-    pub const LEN: usize = 1000; // todo: calculate correct length
+    pub const LEN: usize = 200 + 200; // additional 200 for `bridge_node_psl_address` and `registration_entrance_fee_transaction_signature`
     pub const PREFIX: &'static [u8] = b"bridge_node";
 }
 
@@ -369,7 +363,7 @@ pub struct ServiceRequest {
 }
 
 impl ServiceRequest {
-    pub const LEN: usize = 1000; // todo: calculate correct length
+    pub const LEN: usize = 360 + 300; // additional 300 for `first_6_characters_of_sha3_256_hash_of_corresponding_file`, `ipfs_cid` and `pastel_txid`
     pub const PREFIX: &'static [u8] = b"service_request";
 
     // Function to generate the service_request_id based on the service type,
@@ -419,7 +413,7 @@ pub struct ServicePriceQuote {
 }
 
 impl ServicePriceQuote {
-    pub const LEN: usize = 1000; // todo: calculate correct length
+    pub const LEN: usize = 89;
     pub const PREFIX: &'static [u8] = b"service_price_quote";
 }
 
@@ -433,7 +427,7 @@ pub struct BestPriceQuote {
 }
 
 impl BestPriceQuote {
-    pub const LEN: usize = 1000; // todo: calculate correct length
+    pub const LEN: usize = 89;
     pub const PREFIX: &'static [u8] = b"best_price_quote";
 }
 
@@ -483,10 +477,8 @@ impl<'info> Initialize<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(pastel_id: String)]
+#[instruction(pastel_id: [u8; 32])]
 pub struct RegisterNewBridgeNode<'info> {
-    /// CHECK: Manual checks are performed in the instruction to ensure the contributor_account is valid and safe to use.
-    #[account(mut)]
     pub user: Signer<'info>,
 
     #[account(mut)]
@@ -497,13 +489,13 @@ pub struct RegisterNewBridgeNode<'info> {
 
     /// unique bridge_node seeded by pastel_id given a bridge
     #[account(init,
-        seeds = [BridgeNode::PREFIX, pastel_id.as_bytes(), &bridge.key().to_bytes()], bump,
+        seeds = [BridgeNode::PREFIX, &pastel_id, &bridge.key().to_bytes()], bump,
         payer = payer, space = BridgeNode::LEN
     )]
     pub bridge_node: Account<'info, BridgeNode>,
 
     /// CHECK: unique by bridge
-    #[account(
+    #[account(mut,
         seeds = [Bridge::REWARD_POOL_PREFIX, &bridge.key().to_bytes()],
         bump = bridge.bridge_reward_pool_bump,
     )]
@@ -516,7 +508,7 @@ impl<'info> RegisterNewBridgeNode<'info> {
     pub fn handle(
         &mut self,
         bump: u8,
-        pastel_id: &String,
+        pastel_id: &[u8; 32],
         bridge_node_psl_address: &String,
     ) -> Result<()> {
         // pay non-refundable fee
@@ -524,7 +516,7 @@ impl<'info> RegisterNewBridgeNode<'info> {
             CpiContext::new(
                 self.system_program.to_account_info(),
                 Transfer {
-                    from: self.user.to_account_info(),
+                    from: self.payer.to_account_info(),
                     to: self.bridge_reward_pool.to_account_info(),
                 },
             ),
@@ -562,7 +554,6 @@ impl<'info> RegisterNewBridgeNode<'info> {
 #[derive(Accounts)]
 #[instruction(pastel_ticket_type: PastelTicketType, first_6_chars_of_hash: String)]
 pub struct SubmitServiceRequest<'info> {
-    #[account(mut)]
     pub user: Signer<'info>,
 
     #[account(mut)]
@@ -662,19 +653,21 @@ impl<'info> InitializeBestPriceQuote<'info> {
 
 #[derive(Accounts)]
 pub struct SubmitPriceQuote<'info> {
+    pub reward_address: Signer<'info>,
+
     #[account(mut)]
     pub payer: Signer<'info>,
 
     #[account(mut)]
     pub bridge: Account<'info, Bridge>,
 
-    #[account(mut, has_one = bridge)]
+    #[account(mut, has_one = bridge, has_one = reward_address)]
     pub bridge_node: Account<'info, BridgeNode>,
 
     #[account(has_one = bridge)]
     pub service_request: Account<'info, ServiceRequest>,
 
-    #[account(mut)]
+    #[account(mut, has_one = service_request)]
     pub best_price_quote: Account<'info, BestPriceQuote>,
 
     #[account(init,
@@ -764,9 +757,9 @@ impl<'info> SubmitPriceQuote<'info> {
 #[derive(Accounts)]
 pub struct SubmitPastelTxid<'info> {
     #[account(mut)]
-    pub payer: Signer<'info>,
+    pub user: Signer<'info>,
 
-    #[account(mut,
+    #[account(mut, has_one = bridge, has_one = user,
         constraint = service_request.selected_bridge_node.is_some() @ BridgeError::BridgeNodeNotSelected,
         constraint = service_request.selected_bridge_node.unwrap() == bridge_node.key() @ BridgeError::BridgeNodeNotSelected,
         constraint = service_request.status == RequestStatus::Pending @ BridgeError::InvalidRequestStatus,
@@ -774,8 +767,7 @@ pub struct SubmitPastelTxid<'info> {
     pub service_request: Account<'info, ServiceRequest>,
 
     // The bridge contract state
-    #[account(
-        mut,
+    #[account(mut,
         constraint = bridge.is_paused @ BridgeError::ContractPaused
     )]
     pub bridge: Account<'info, Bridge>,
